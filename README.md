@@ -36,99 +36,63 @@ This guide provides the exact steps to integrate the health checker into your `t
 
 ### **Step 1: Modify `ton-index-worker/Dockerfile`**
 
-We will use a multi-stage Docker build to compile the Go healthchecker and inject it into the final `index-worker` image without installing the entire Go toolchain.
+To integrate the health checker, we will add a new build stage to compile the Go binary and then copy it into the final image.
 
-**Action:** Replace the entire content of `ton-index-worker/Dockerfile` with the following:
+**1. Add the Healthchecker Build Stage**
+
+At the very **top** of `ton-index-worker/Dockerfile`, add the following block. This stage downloads and compiles the healthchecker.
 
 ```dockerfile
 # =================================================================
-# Стадия 1: Сборка нашего Go Healthchecker'а из внешнего репозитория
-# Это наш новый, добавленный блок.
+# Stage 1: Build the Go Healthchecker from the external repository
+# This is our new, added block.
 # =================================================================
 FROM golang:1.21-alpine AS healthchecker-builder
 
-# Устанавливаем git, чтобы иметь возможность клонировать репозиторий
+# Install git to allow cloning the repository
 RUN apk add --no-cache git
 
 WORKDIR /src
 
-# Клонируем ваш репозиторий с хелсчекером
-# Используем --depth 1 для ускорения, так как нам не нужна вся история коммитов
+# Clone the healthchecker repository
+# Use --depth 1 for speed, as we don't need the full commit history
 RUN git clone --depth 1 https://github.com/egorkaBurkenya/ton-indexer-healthchecker-go.git .
 
-# Собираем статичный бинарный файл. Это самый надежный способ для встраивания.
+# Build a static binary. This is the most reliable way to embed it.
 RUN CGO_ENABLED=0 go build -o /healthchecker .
+```
 
+**2. Copy the Compiled Binary**
 
-# =================================================================
-# Стадия 2: Сборка C++ компонентов (ВАШ ОРИГИНАЛЬНЫЙ КОД)
-# Этот блок остается без изменений.
-# =================================================================
-FROM ubuntu:22.04 as builder
-RUN DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get update -y && apt-get -y install tzdata && rm -rf /var/lib/{apt,dpkg,cache,log}/
-RUN apt-get update -y \
-    && apt-get install -y build-essential cmake clang openssl libssl-dev zlib1g-dev \
-                   gperf wget git curl ccache libmicrohttpd-dev liblz4-dev \
-                   pkg-config libsecp256k1-dev libsodium-dev libhiredis-dev python3-dev libpq-dev \
-                   automake libjemalloc-dev lsb-release software-properties-common gnupg \
-                   autoconf libtool \
-    && rm -rf /var/lib/{apt,dpkg,cache,log}/
+In the **final stage** of your `Dockerfile` (the one that starts with `FROM ubuntu:22.04`), find the `ENTRYPOINT` instruction. Just **before** the `ENTRYPOINT`, add this line:
 
-# building
-COPY external/ /app/external/
-COPY pgton/ /app/pgton/
-COPY celldb-migrate/ /app/celldb-migrate/
-COPY ton-index-clickhouse/ /app/ton-index-clickhouse/
-COPY ton-index-postgres/ /app/ton-index-postgres/
-COPY ton-integrity-checker/ /app/ton-integrity-checker/
-COPY ton-smc-scanner/ /app/ton-smc-scanner/
-COPY ton-trace-emulator/ /app/ton-trace-emulator/
-COPY ton-trace-task-emulator/ /app/ton-trace-task-emulator/
-COPY tondb-scanner/ /app/tondb-scanner/
-COPY CMakeLists.txt /app/
-
-WORKDIR /app/build
-RUN cmake -DCMAKE_BUILD_TYPE=Release ..
-RUN make -j$(nproc) ton-index-postgres ton-index-postgres-migrate ton-index-clickhouse ton-smc-scanner ton-integrity-checker ton-trace-emulator
-
-
-# =================================================================
-# Стадия 3: Финальный образ (ВАШ ОРИГИНАЛЬНЫЙ КОД + ОДНА СТРОКА)
-# =================================================================
-FROM ubuntu:22.04
-RUN DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get update -y && apt-get -y install tzdata && rm -rf /var/lib/{apt,dpkg,cache,log}/
-RUN apt-get update -y \
-    && apt install -y dnsutils libpq-dev libsecp256k1-dev libsodium-dev libhiredis-dev \
-    && rm -rf /var/lib/{apt,dpkg,cache,log}/
-
-COPY scripts/entrypoint.sh /entrypoint.sh
-COPY --from=builder /app/build/ton-index-postgres/ton-index-postgres /usr/bin/ton-index-postgres
-COPY --from=builder /app/build/ton-index-postgres/ton-index-postgres-migrate /usr/bin/ton-index-postgres-migrate
-COPY --from=builder /app/build/ton-index-clickhouse/ton-index-clickhouse /usr/bin/ton-index-clickhouse
-COPY --from=builder /app/build/ton-smc-scanner/ton-smc-scanner /usr/bin/ton-smc-scanner
-COPY --from=builder /app/build/ton-integrity-checker/ton-integrity-checker /usr/bin/ton-integrity-checker
-COPY --from=builder /app/build/ton-trace-emulator/ton-trace-emulator /usr/bin/ton-trace-emulator
-
-# --- НАШЕ ВТОРОЕ ДОБАВЛЕНИЕ ---
-# Копируем наш скомпилированный healthchecker из самой первой стадии.
-# Теперь он будет доступен внутри контейнера по пути /usr/local/bin/healthchecker.
+```dockerfile
+# --- ADDITION ---
+# Copy our compiled healthchecker from the very first stage.
+# It will now be available inside the container at /usr/local/bin/healthchecker.
 COPY --from=healthchecker-builder /healthchecker /usr/local/bin/healthchecker
-# --- КОНЕЦ ДОБАВЛЕНИЯ ---
+# --- END OF ADDITION ---
 
 ENTRYPOINT [ "/entrypoint.sh" ]
 ```
 
 ### **Step 2: Modify `docker-compose.yaml`**
 
-Next, we configure the `index-worker` service to use the new build context and activate the health check.
+Next, configure the `index-worker` service in your root `docker-compose.yaml` to build from the modified `Dockerfile` and use the healthcheck.
 
-**Action:** Find the `index-worker` service in your root `docker-compose.yaml` and replace its definition with the following:
+**Action:** In your `docker-compose.yaml`, find the service named `index-worker` and make the following changes:
+
+1.  **Add the `build` configuration** to tell Docker to use your local, modified `Dockerfile`.
+2.  **Remove the `restart` policy** (e.g., `restart: unless-stopped`), as it will be replaced by the more powerful `deploy` policy.
+3.  **Add the `deploy` and `healthcheck` sections** to enable Swarm-managed restarts based on the healthchecker's output.
+
+Your final `index-worker` service definition should look like this:
 
 ```yaml
   index-worker:
     image: toncenter/ton-indexer-worker:${VERSION:-latest}
-    # Мы используем наш модифицированный Dockerfile.
-    # Контекст сборки теперь - корень проекта, чтобы Dockerfile мог найти все папки.
+    # Add this build section to use our modified Dockerfile.
+    # The build context is the project root, so the Dockerfile can find all source folders.
     build:
       context: .
       dockerfile: ton-index-worker/Dockerfile
@@ -146,7 +110,6 @@ Next, we configure the `index-worker` service to use the new build context and a
     networks:
       internal:
     command:
-      # Обратите внимание, что здесь теперь список (правильный YAML синтаксис)
       - --pg
       - postgresql://${POSTGRES_USER}@postgres:${POSTGRES_PORT}/${POSTGRES_DBNAME}
       - --db
@@ -156,8 +119,8 @@ Next, we configure the `index-worker` service to use the new build context and a
       - --from
       - "${TON_WORKER_FROM:-1}"
 
-    # --- НАЧАЛО НАШИХ ИЗМЕНЕНИЙ ---
-    # Убираем старую политику restart и добавляем новую, управляемую Swarm.
+    # --- START OF OUR CHANGES ---
+    # Remove any old restart policy and add the new Swarm-managed one.
     
     deploy:
       replicas: 1
@@ -168,15 +131,15 @@ Next, we configure the `index-worker` service to use the new build context and a
         window: 120s
 
     healthcheck:
-      # Вызываем наш скомпилированный Go-хелсчекер!
-      # Docker будет запускать эту команду внутри контейнера index-worker.
+      # This calls our compiled Go healthchecker!
+      # Docker will run this command inside the index-worker container.
       test: ["CMD", "/usr/local/bin/healthchecker"]
-      interval: 60s    # Проверять каждую минуту.
-      timeout: 15s     # Считать проверку "зависшей" через 15 секунд.
-      retries: 3       # После 3 неудачных проверок подряд контейнер будет перезапущен.
-      start_period: 3m # Не начинать проверки в первые 3 минуты после старта контейнера.
+      interval: 60s    # Check every minute.
+      timeout: 15s     # Consider the check "hung" after 15 seconds.
+      retries: 3       # After 3 consecutive failures, the container will be restarted.
+      start_period: 3m # Don't run checks for the first 3 minutes after the container starts.
       
-    # --- КОНЕЦ НАШИХ ИЗМЕНЕНИЙ ---
+    # --- END OF OUR CHANGES ---
 ```
 
 ### **Step 3: Build and Deploy**
