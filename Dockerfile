@@ -1,13 +1,9 @@
 # Stage 1: Build the Go Healthchecker
-FROM golang:1.21-alpine AS builder
-
-# Install git to allow cloning the repository
-RUN apk add --no-cache git
+FROM golang:1.18-alpine AS builder
 
 WORKDIR /src
 
-# Clone the healthchecker repository
-RUN git clone --depth 1 https://github.com/egorkaBurkenya/ton-indexer-healthchecker-go.git .
+COPY . .
 
 # Build a static binary
 RUN CGO_ENABLED=0 go build -o /healthchecker .
